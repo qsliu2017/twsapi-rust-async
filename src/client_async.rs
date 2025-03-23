@@ -8,7 +8,10 @@ use time::{macros::format_description, OffsetDateTime};
 use time_tz::{timezones, OffsetResult, PrimitiveDateTimeExt, Tz};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
     sync::Mutex,
 };
 
@@ -125,7 +128,8 @@ pub(crate) type Response = Result<ResponseMessage, Error>;
 struct Connection {
     client_id: i32,
     connection_url: String,
-    tcp_stream: Mutex<TcpStream>,
+    reader: Mutex<OwnedReadHalf>,
+    writer: Mutex<OwnedWriteHalf>,
     connection_metadata: Mutex<ConnectionMetadata>,
     max_retries: i32,
 }
@@ -136,11 +140,13 @@ const MAX_RETRIES: i32 = 20;
 impl Connection {
     pub async fn connect(client_id: i32, connection_url: &str) -> Result<Self, Error> {
         let tcp_stream = TcpStream::connect(connection_url).await?;
+        let (reader, writer) = tcp_stream.into_split();
 
         let connection = Self {
             client_id,
             connection_url: connection_url.into(),
-            tcp_stream: Mutex::new(tcp_stream),
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
             connection_metadata: Mutex::new(ConnectionMetadata {
                 client_id,
                 ..Default::default()
@@ -161,13 +167,13 @@ impl Connection {
     }
 
     async fn write(&self, data: &str) -> Result<(), Error> {
-        let mut writer = self.tcp_stream.lock().await;
+        let mut writer = self.writer.lock().await;
         writer.write_all(data.as_bytes()).await?;
         Ok(())
     }
 
     async fn write_message(&self, message: &RequestMessage) -> Result<(), Error> {
-        let mut writer = self.tcp_stream.lock().await;
+        let mut writer = self.writer.lock().await;
 
         let data = message.encode();
         debug!("-> {data:?}");
@@ -182,7 +188,7 @@ impl Connection {
     }
 
     async fn read_message(&self) -> Response {
-        let mut reader = self.tcp_stream.lock().await;
+        let mut reader = self.reader.lock().await;
 
         let message_size = read_header(&mut reader).await?;
         let mut data = vec![0_u8; message_size];
@@ -303,7 +309,7 @@ pub(crate) struct ConnectionMetadata {
     pub(crate) time_zone: Option<&'static Tz>,
 }
 
-async fn read_header(reader: &mut TcpStream) -> Result<usize, Error> {
+async fn read_header(reader: &mut OwnedReadHalf) -> Result<usize, Error> {
     let mut buffer = [0; 4];
     reader.read_exact(&mut buffer).await?;
 
